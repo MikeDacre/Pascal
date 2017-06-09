@@ -1,0 +1,329 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Rewrite of the shell script for easy running from anywhere with cluster support
+"""
+from __future__ import print_function
+import os as _os
+import sys as _sys
+import subprocess as _sub
+import argparse as _argparse
+import multiprocessing as _mp
+
+VERBOSE = False  # Show debug output
+
+###############################################################################
+#                          Main Execution Functions                           #
+###############################################################################
+
+
+def run_pascal(sample_file, **kwargs):
+    """Run the pascal Java command."""
+    cmnd = (
+        'export DYLD_LIBRARY_PATH={path}/lib:$LD_LIBRARY_PATH; \n'
+        'export LD_LIBRARY_PATH="{path}/lib:{path}/lib/openBLASlib/lib:'
+        '{path}/lib/fortranlibs:$LD_LIBRARY_PATH"; \n'
+        'export OPENBLAS_NUM_THREADS=1; \n'
+        'java -ea -Xmx{mem} -jar {path}/jars/pascalDeployed.jar {args}'
+    )
+
+    path, java64 = get_runtime_info()
+    mem = '32g' if java64 else '2g'
+    strtdir = _os.path.abspath(_os.curdir)
+    outdir = kwargs['outdir'] if 'outdir' in kwargs else '.'
+    outdir = _os.path.abspath(outdir)
+    argstr = get_pascal_arg_string(sample_file, **kwargs)
+
+    if not _os.path.isdir(outdir):
+        _os.mkdir(outdir)
+
+    try:
+        _os.chdir(path)
+        if VERBOSE:
+            print(cmnd.format(path=path, mem=mem, args=argstr))
+        print('Running Pascal on {}'.format(sample_file))
+        out, err, code = _run(cmnd.format(path=path, mem=mem, args=argstr))
+    finally:
+        _os.chdir(strtdir)
+
+    return out, err, code
+
+
+###############################################################################
+#                              Helper Functions                               #
+###############################################################################
+
+
+def get_pascal_arg_string(sample_file, **kwargs):
+    """Take all keyword arguments and return an argument string for pascal."""
+    allowed_args = ['chr', 'up', 'down', 'maxsnp', 'outsuffix', 'custom',
+                    'mergeddistance', 'mafcutoff', 'genesetfile', 'customdir']
+    argstr = '--pval={} '.format(_os.path.abspath(sample_file))
+
+    # Handle outdir parsing
+    if 'outdir' in kwargs:
+        #  outdir = _os.path.basename(kwargs.pop('outdir'))
+        outdir = _os.path.abspath(kwargs.pop('outdir'))
+        argstr += '--outdir={} '.format(outdir)
+
+    # Gene Scoring Method
+    if 'genescoring' in kwargs:
+        scoremethod = kwargs.pop('genescoring')
+    else:
+        scoremethod = 'sum'
+    scoremethod = scoremethod.lower()
+    if scoremethod not in ['max', 'sum']:
+        raise ValueError('Invalid genescoring method: {}. Choose max or sum'
+                         .format(scoremethod))
+    argstr += '--maxvegas ' if scoremethod == 'max' else '--analyticvegas '
+
+    # Calculate pathway scores
+    if 'runpathway' in kwargs:
+        v = kwargs.pop('runpathway')
+        m = kwargs.pop('mergedistance') if 'mergedistance' in kwargs else None
+        if v:
+            if not m:
+                m = 1
+            argstr += '--runpathway --mergedistance={}'.format(m)
+
+    # Handle simple arguments
+    for k, v in kwargs.items():
+        if not v:
+            continue
+        if k in allowed_args:
+            argstr += '--{}={} '.format(k, v)
+        else:
+            _sys.stderr.write('Ignoring unrecognized argument --{}\n'
+                              .format(k))
+    return argstr
+
+
+def get_runtime_info():
+    """Return a information sufficient to run pascal.
+
+    Returns
+    -------
+    path : string
+        absolute path to pascal's root
+    java64 : bool
+        True if 64 bit java
+    """
+    path = _os.path.dirname(_os.path.realpath(__file__))
+    if 'jars' not in _os.listdir(path):
+        path = _os.path.dirname(path)
+        if 'jars' not in _os.listdir(path):
+            raise OSError('Cannot find PATH to Pascal, make sure this script' +
+                          ' is in the root or bin directory of the Pascal' +
+                          ' package.')
+    assert _os.path.isdir(path)
+    assert _os.path.isdir(_os.path.join(path, 'lib'))
+    assert _os.path.isdir(_os.path.join(path, 'jars'))
+
+    _, err, code = _run('java -version')
+    if int(code) != 0 or not err:
+        raise OSError('Java does not appear to be installed as ' +
+                      '`java --version` fails')
+    if '64-Bit' in err:
+        java64 = True
+    else:
+        java64 = False
+        _sys.stderr.write(
+            "java 32-Bit called instead of 64-Bit. You might run into "
+            "memory problems.\nConsider installing the 64-Bit java VM.\n"
+        )
+
+    return path, java64
+
+
+def _run(command, raise_on_error=False):
+    """Run a command with subprocess the way it should be.
+
+    Parameters
+    ----------
+    command : str
+        A command to execute, piping is fine.
+    raise_on_error : bool
+        Raise a subprocess.CalledProcessError on exit_code != 0
+
+    Returns
+    -------
+    stdout : str
+    stderr : str
+    exit_code : int
+    """
+    pp = _sub.Popen(command, shell=True, universal_newlines=True,
+                    stdout=_sub.PIPE, stderr=_sub.PIPE)
+    out, err = pp.communicate()
+    code = pp.returncode
+    if raise_on_error and code != 0:
+        raise _sub.CalledProcessError(
+            returncode=code, cmd=command, output=out, stderr=err
+        )
+    return out, err, code
+
+
+###############################################################################
+#                            Command Line Parsing                             #
+###############################################################################
+
+
+def argument_parser():
+    """Parse all arguments."""
+    path, _ = get_runtime_info()
+    parser = _argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=_argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show debug output')
+
+    # Universal arguments
+    shared = _argparse.ArgumentParser(add_help=False)
+    shared.add_argument('-o', '--outdir',
+                        help='Directory to output files to')
+    shared.add_argument('--outsuffix',
+                        help=(
+                            'Adds an additional string to the output file '
+                            'names produced.'
+                        ))
+    shared.add_argument('--chr', type=int, help='limit to this chromosome')
+    shared.add_argument('--up', type=int, default=50000,
+                        help=(
+                            'Gives the number of base-pairs upstream of the '
+                            'transcription start site that are still counted '
+                            'as belonging to the gene region. The default is '
+                            "50’000."
+                        ))
+    shared.add_argument('--down', type=int, default=50000,
+                        help=(
+                            'Gives the number of base-pairs downstream of '
+                            'the gene-body that are still counted as '
+                            'belonging to the gene region. The default is '
+                            "50’000."
+                        ))
+    shared.add_argument('--maxsnp', type=int, default=3000,
+                        help=(
+                            'Sets the aximum number of SNPs per gene. If a '
+                            'gene has more SNPs in its region it will not '
+                            'calculate the score. If the option is set to -1, '
+                            'all genes will be computed. The default is 3000.'
+                        ))
+    shared.add_argument('--genescoring', type=str, choices={'sum', 'max'},
+                        default='sum', help=(
+                            'Chooses the genescoring method. The default is '
+                            'sum. This option should be supplied with either'
+                            'max or sum.'
+                        ))
+    shared.add_argument('--runpathway', action='store_true',
+                        help=(
+                            'Chooses whether Pascal should be calculate '
+                            'pathway scores.'
+                        ))
+    shared.add_argument('--mergedistance', type=int, default=1,
+                        help=(
+                            'Gives the genomic distance in mega-bases that '
+                            'the program uses to fuse nearby genes during the '
+                            'pathway analysis. Only has an effect if '
+                            'runpathway is on. The default is 1.'
+                        ))
+    shared.add_argument('--mafcutoff', type=float, default=0.05,
+                        help=(
+                            'SNPs with maf below that value in the european '
+                            'sample of 1KG will be ignored.  The default is '
+                            '0.05'
+                        ))
+    shared.add_argument('--genesetfile',
+                        default = _os.path.join(
+                            path, 'resources/genesets/msigdb/' +
+                            'msigBIOCARTA_KEGG_REACTOME.gmt'
+                        ),
+                        help=(
+                            'Gives the file name to a gmt-file where the gene '
+                            'sets are defined. The default is '
+                            'resources/genesets/msigdb/'
+                            'msigBIOCARTA_KEGG_REACTOME.gmt'
+                        ))
+
+    cref = shared.add_argument_group(
+        'custom reference',
+        description=(
+            'Pascal allows to use custom reference populations instead of the '
+            '1KG-EUR sam- ple (For an example about formatting and parameter '
+            'setting, check the bash script examples/exampleRunFromTped.sh). '
+            'To make use of this option, you have to provide your genotype '
+            'information in gnu-zipped, space-separated and 1-2-coded '
+            'tped-files split by chromosome. the tped format has been '
+            'popularized by the plink-tool for GWAS analysis.'
+        )
+    )
+    cref.add_argument('--customdir',
+                      help=(
+                          'Gives the path to where the gnu-zipped tped-files '
+                          'are stored.'
+                      ))
+    cref.add_argument('--custom',
+                      help=(
+                          'Gives the prefix of a gnuzipped tped-files. The '
+                          'total filename per chromosome is '
+                          '<prefix>.chr<chrNr>.tped.gz.'
+                      ))
+
+    modes = parser.add_subparsers(title='mode', dest='mode')
+
+    # Run simply with only one sample
+    single = modes.add_parser(
+        'single', parents=[shared],
+        help="Run pascal directly on a single dataset"
+    )
+    single.add_argument('snp_file', help='File of rsid\\tpval to analyze')
+
+    return parser
+
+
+###############################################################################
+#                                Run Directly                                 #
+###############################################################################
+
+
+def main(argv=None):
+    """Run as a script."""
+    if not argv:
+        argv = _sys.argv[1:]
+
+    parser = argument_parser()
+
+    args = parser.parse_args(argv)
+
+    if not args.mode:
+        parser.print_help()
+        _sys.exit(1)
+
+    if args.verbose:
+        global VERBOSE
+        VERBOSE = True
+
+    # Convert to dictionary
+    opts = vars(args)
+    if VERBOSE:
+        print(opts)
+
+    outdir = args.outdir
+    outdir = _os.path.abspath(outdir if outdir.strip() else _os.curdir)
+    mode = opts.pop('mode')
+    if mode == 'single':
+        sample_file = opts.pop('snp_file')
+        name = _os.path.join(
+            outdir,
+            _os.path.splitext(_os.path.basename(sample_file))[0]
+        )
+        out, err, code = run_pascal(sample_file, **opts)
+        with open(name + '.out', 'w') as fout:
+            fout.write(out)
+        with open(name + '.err', 'w') as fout:
+            fout.write(err)
+        _sys.exit(code)
+
+
+if __name__ == '__main__' and '__file__' in globals():
+    _sys.exit(main())

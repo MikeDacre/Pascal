@@ -1,7 +1,12 @@
-/bin
-/lib
-/PASCAL_Package
+# Ipython
+.ipynb_checkpoints
 
-.settings
-.classpath
-.project
+# Apple's junk
+.DS_Store
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Pyenv
+.python-version
